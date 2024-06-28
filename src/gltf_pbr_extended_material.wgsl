@@ -1,7 +1,12 @@
 #import bevy_pbr::forward_io::{FragmentOutput, VertexOutput}
 #import bevy_pbr::lighting::{F_Schlick, F_Schlick_vec}
 #import bevy_pbr::pbr_fragment::pbr_input_from_standard_material
-#import bevy_pbr::pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing}
+#import bevy_pbr::pbr_functions::{
+    apply_pbr_lighting,
+    calculate_diffuse_color,
+    calculate_F0,
+    main_pass_post_lighting_processing,
+}
 
 struct GltfPbrExtensionData {
     iridescence_factor: f32,
@@ -24,17 +29,25 @@ const XYZ_TO_REC709: mat3x3<f32> = mat3x3(
 	vec3(-0.4985314,  0.0415560,  1.0572252),
 );
 
+fn pow2(x: f32) -> f32 {
+    return x * x;
+}
+
+fn pow2_vec(x: vec3<f32>) -> vec3<f32> {
+    return x * x;
+}
+
 fn fresnel_0_to_ior(fresnel_0: vec3<f32>) -> vec3<f32> {
     let sqrt_F0 = sqrt(fresnel_0);
     return (vec3(1.0) + sqrt_F0) / (vec3(1.0) - sqrt_F0);
 }
 
 fn ior_to_fresnel_0_vec(transmitted_ior: vec3<f32>, incident_ior: f32) -> vec3<f32> {
-    return pow(vec3(2.0), (transmitted_ior - incident_ior) / (transmitted_ior + incident_ior));
+    return pow2_vec((transmitted_ior - incident_ior) / (transmitted_ior + incident_ior));
 }
 
 fn ior_to_fresnel_0(transmitted_ior: f32, incident_ior: f32) -> f32 {
-    return pow(2.0, (transmitted_ior - incident_ior) / (transmitted_ior + incident_ior));
+    return pow2((transmitted_ior - incident_ior) / (transmitted_ior + incident_ior));
 }
 
 fn eval_sensitivity(OPD: f32, shift: vec3<f32>) -> vec3<f32> {
@@ -43,10 +56,10 @@ fn eval_sensitivity(OPD: f32, shift: vec3<f32>) -> vec3<f32> {
     let pos = vec3(1.6810e+06, 1.7953e+06, 2.2084e+06);
     let varx = vec3(4.3278e+09, 9.3046e+09, 6.6121e+09);
 
-    var xyz = val * sqrt(2.0 * PI * varx) * cos(pos * phase + shift) * exp(-pow(2.0, phase) * varx);
+    var xyz = val * sqrt(2.0 * PI * varx) * cos(pos * phase + shift) * exp(-pow2(phase) * varx);
     xyz.x += 9.7470e-14 * sqrt(2.0 * PI * 4.5282e+09) *
         cos(2.2399e+06 * phase + shift.x) *
-        exp(-4.5282e+09 * pow(2.0, phase));
+        exp(-4.5282e+09 * pow2(phase));
     xyz /= 1.0685e-7;
 
     let rgb = XYZ_TO_REC709 * xyz;
@@ -57,7 +70,48 @@ fn eval_sensitivity(OPD: f32, shift: vec3<f32>) -> vec3<f32> {
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
+    var iridescence_thickness = pbr_extension_data.iridescence_thickness_maximum;
+#ifdef HAS_IRIDESCENCE_THICKNESS_TEXTURE
+    let iridescence_thickness_factor = textureSample(
+        iridescence_thickness_texture,
+        iridescence_thickness_sampler,
+        in.uv,
+    ).g;
+    let iridescence_thickness_minimum = pbr_extension_data.iridescence_thickness_minimum;
+    iridescence_thickness = mix(
+        iridescence_thickness_minimum,
+        iridescence_thickness,
+        iridescence_thickness_factor,
+    );
+#endif  // HAS_IRIDESCENCE_THICKNESS_TEXTURE
+
     pbr_input.custom_fresnel_amount = vec3(pbr_extension_data.iridescence_factor);
+
+    /*let specular_intensity_factor = 1.0;
+    let specular_color_factor = vec3(1.0);
+
+    let specular_color = mix(
+        min(
+            specular_color_factor *
+                pow2((pbr_input.material.ior - 1.0) / (pbr_input.material.ior + 1.0)),
+            vec3(1.0)
+        ) * specular_intensity_factor,
+        pbr_input.material.base_color.rgb * (1.0 - pbr_input.material.metallic),
+        pbr_input.material.metallic
+    );*/
+
+    let metallic = pbr_input.material.metallic;
+    let reflectance = pbr_input.material.reflectance;
+    let diffuse_transmission = pbr_input.material.diffuse_transmission;
+    let specular_transmission = pbr_input.material.specular_transmission;
+
+    /*let diffuse_color = calculate_diffuse_color(
+        pbr_input.material.base_color.rgb,
+        metallic,
+        specular_transmission,
+        diffuse_transmission
+    );*/
+    let specular_color = calculate_F0(pbr_input.material.base_color.rgb, metallic, reflectance);
 
     // Iridescence
 
@@ -67,11 +121,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let outside_ior = 1.0;
     let eta2 = pbr_extension_data.iridescence_ior;
     let cos_theta_1 = saturate(dot(N, V));
-    let thin_film_thickness = pbr_extension_data.iridescence_thickness_maximum; // TODO: What?
-    let base_F0 = vec3(1.0);
+    let thin_film_thickness = iridescence_thickness;
+    let base_F0 = specular_color;
 
     let iridescence_ior = eta2; // TODO
-    let sin_theta_2_sq = pow(2.0, outside_ior / iridescence_ior) * (1.0 - pow(2.0, cos_theta_1));
+    let sin_theta_2_sq = pow2(outside_ior / iridescence_ior) * (1.0 - pow2(cos_theta_1));
 
     // Handle TIR
     var I = vec3(1.0);
@@ -87,7 +141,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         let phi21 = PI - phi12;
 
         // Second interface
-        let base_ior = fresnel_0_to_ior(vec3(0.9999));
+        let base_ior = fresnel_0_to_ior(clamp(base_F0, vec3(0.0), vec3(0.9999)));
         let R1 = ior_to_fresnel_0_vec(base_ior, iridescence_ior);
         let R23 = F_Schlick_vec(R1, 1.0, cos_theta_2);
         let phi23 = select(vec3(0.0), vec3(PI), base_ior < vec3(iridescence_ior));
@@ -99,7 +153,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         // Compound terms
         let R123 = clamp(R12 * R23, vec3(1.0e-5), vec3(0.9999));
         let r123 = sqrt(R123);
-        let Rs = pow(2.0, T121) * R23 / (vec3(1.0) - R123);
+        let Rs = pow2(T121) * R23 / (vec3(1.0) - R123);
 
         // Reflectance term for m = 0 (DC term amplitude)
         let C0 = R12 + Rs;
@@ -122,5 +176,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    //out.color = vec4(pbr_input.custom_fresnel, 1.0);
     return out;
 }

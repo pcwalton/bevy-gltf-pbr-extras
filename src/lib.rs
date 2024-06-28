@@ -1,10 +1,17 @@
 use bevy::{
     app::{App, Plugin},
     asset::{load_internal_asset, Asset, Handle},
-    pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin, StandardMaterial},
+    pbr::{
+        ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+        MaterialPlugin, StandardMaterial,
+    },
     reflect::{std_traits::ReflectDefault, Reflect},
     render::{
-        render_resource::{AsBindGroup, Shader, ShaderRef, ShaderType},
+        mesh::MeshVertexBufferLayoutRef,
+        render_resource::{
+            AsBindGroup, RenderPipelineDescriptor, Shader, ShaderRef, ShaderType,
+            SpecializedMeshPipelineError,
+        },
         texture::Image,
     },
 };
@@ -15,6 +22,7 @@ pub struct GltfPbrExtrasPlugin;
 
 #[derive(Clone, Asset, AsBindGroup, Default, Reflect, Debug)]
 #[reflect(Default)]
+#[bind_group_data(GltfPbrExtensionKey)]
 pub struct GltfPbrExtension {
     #[uniform(100)]
     pub pbr_extension_data: GltfPbrExtensionData,
@@ -32,6 +40,12 @@ pub struct GltfPbrExtensionData {
     pub iridescence_ior: f32,
     pub iridescence_thickness_minimum: f32,
     pub iridescence_thickness_maximum: f32,
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+pub struct GltfPbrExtensionKey {
+    has_iridescence_texture: bool,
+    has_iridescence_thickness_texture: bool,
 }
 
 pub type GltfPbrExtendedMaterial = ExtendedMaterial<StandardMaterial, GltfPbrExtension>;
@@ -59,6 +73,28 @@ impl MaterialExtension for GltfPbrExtension {
     fn deferred_fragment_shader() -> ShaderRef {
         SHADER_HANDLE.clone().into()
     }
+
+    fn specialize(
+        _: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _: &MeshVertexBufferLayoutRef,
+        key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if let Some(ref mut fragment_state) = descriptor.fragment {
+            if key.bind_group_data.has_iridescence_texture {
+                fragment_state
+                    .shader_defs
+                    .push("HAS_IRIDESCENCE_TEXTURE".into());
+            }
+            if key.bind_group_data.has_iridescence_thickness_texture {
+                fragment_state
+                    .shader_defs
+                    .push("HAS_IRIDESCENCE_THICKNESS_TEXTURE".into());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for GltfPbrExtensionData {
@@ -69,6 +105,15 @@ impl Default for GltfPbrExtensionData {
             iridescence_ior: 1.3,
             iridescence_thickness_minimum: 100.0,
             iridescence_thickness_maximum: 400.0,
+        }
+    }
+}
+
+impl From<&GltfPbrExtension> for GltfPbrExtensionKey {
+    fn from(value: &GltfPbrExtension) -> Self {
+        GltfPbrExtensionKey {
+            has_iridescence_texture: value.iridescence_texture.is_some(),
+            has_iridescence_thickness_texture: value.iridescence_thickness_texture.is_some(),
         }
     }
 }
